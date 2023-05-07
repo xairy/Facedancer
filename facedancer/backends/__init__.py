@@ -1,4 +1,4 @@
 __all__ = [
     "goodfet", "MAXUSBApp", "greatdancer",
-    "raspdancer", "greathost", "libusbhost"
+    "raspdancer", "greathost", "libusbhost", "rawgadget"
 ]
