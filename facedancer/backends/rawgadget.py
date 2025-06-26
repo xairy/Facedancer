@@ -742,6 +742,8 @@ class EndpointOutHandler(EndpointHandler):
     def _gadget_loop(self):
         while not self.stopped.is_set():
             try:
+                # TODO: We should be able to use 4096 instead of max_packet_size,
+                # but tests fail for an unknown reason. Investigate.
                 data = self.backend.device.ep_read(
                     self._handle, self.ep.max_packet_size
                 )
