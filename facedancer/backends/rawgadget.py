@@ -53,6 +53,10 @@ from .base import FacedancerBackend
 
 
 class RawGadgetBackend(FacedancerApp, FacedancerBackend):
+    """
+    Backend for the Linux-based boards that support Raw Gadget.
+    """
+
     app_name = "Raw Gadget"
 
     device: RawGadget
@@ -68,12 +72,12 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         quirks=None,
     ):
         """
-        Initializes the backend.
+        Initializes the Raw Gadget backend.
 
         Args:
-            device  : The device that will act as our UDC.          (Optional)
+            device  : The Raw Gadget device that will act as our Facedancer. (Optional)
             verbose : The verbosity level of the given application. (Optional)
-            quirks  : Unused
+            quirks  : Unused.
         """
         super().__init__(device or RawGadget(), verbose)
 
@@ -90,7 +94,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     def appropriate_for_environment(cls, backend_name: str | None) -> bool:
         """
         Determines if the current environment seems appropriate
-        for using this backend.
+        for using the Raw Gadget backend.
 
         Args:
             backend_name : Backend name being requested. (Optional)
@@ -114,8 +118,9 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         """
         Tells whether the backend requires the data to be split into chunks
         of max packet size when sending this data on an endpoint.
+
+        Returns False, as Raw Gadget packetizes data internally.
         """
-        # Raw Gadget packetizes data internally.
         return False
 
     def connect(
@@ -125,13 +130,12 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         device_speed: DeviceSpeed = DeviceSpeed.FULL,
     ):
         """
-        Prepares backend to connect to the target host and emulate
-        a given device.
+        Prepares the backend to connect to the target host and emulate a given device.
 
         Args:
             usb_device : The USBDevice object that represents the emulated device.
-            max_packet_size_ep0 : Ignored
-            device_speed : Requested usb speed for the Facedancer board.
+            max_packet_size_ep0 : Unused.
+            device_speed : Requested USB speed for the emulated device.
         """
         if self.verbose > 0:
             log.info("connecting device: %s (%r)", usb_device.name, device_speed)
@@ -156,7 +160,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.control = ControlHandler(self)
 
     def disconnect(self):
-        """Disconnects Facedancer from the target host."""
+        """Disconnects Raw Gadget from the target host."""
         assert self.connected_device
         self._disable_endpoints()
         self.control.stop()
@@ -171,20 +175,26 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.connected_device = None
 
     def reset(self):
-        """Does nothing since gadgets cannot initiate device-side resets."""
-        log.info("ignoring reset request")
+        """
+        Supposed to make the backend handle its side of a bus reset.
+
+        Does nothing, as Raw Gadget handles resets internally.
+        """
+        pass
 
     def set_address(self, address: int, defer: bool = False):
         """
-        Raw Gadget backend cannot receive a SET_ADDRESS request, as this
-        request is handled by the UDC driver.
+        Supposed to be called when the device address is being set.
+
+        Not implemented for the Raw Gadget backend, as it cannot receive
+        a SET_ADDRESS request: this request is handled by the UDC driver.
         """
         raise NotImplementedError
 
     def configured(self, configuration):
         """
         Callback that's issued when a USBDevice is configured, e.g. by the
-        SET_CONFIGURATION request. Allows us to apply the new configuration.
+        SET_CONFIGURATION request. Allows the backend to apply the new configuration.
 
         Args:
             configuration : The USBConfiguration object applied by the SET_CONFIG request.
@@ -200,23 +210,24 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.configuration = configuration
         self.is_configured = True
 
-        # TODO: Double check that endpoint threads need to be spawned before the SET_CONFIGURATION request is acked
+        # TODO: Confirm that we enable endpoints before SET_CONFIGURATION request is acked.
         self._enable_endpoints()
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
         """
-        Not used, since endpoints are always consumed internally.
+        Supposed to make the backend read data from the given endpoint.
+
+        Not used with Raw Gadget, as endpoints are read internally.
         """
-        raise NotImplementedError(
-            "read_from_endpoint happens automatically in background"
-        )
+        raise NotImplementedError
 
     def send_on_control_endpoint(self, endpoint_number: int, in_request: USBControlRequest, data: bytes, blocking: bool=True):
         """
-        Sends a collection of USB data in response to a control request by the host.
+        Used to send data in response to an IN control request
+        and for acknowledging both IN and OUT control requests.
 
         Args:
-            endpoint_number  : The number of the IN endpoint on which data should be sent.
+            endpoint_number  : The number of the endpoint on which data should be sent.
             in_request       : The control request being responded to.
             data             : The data to be sent.
             blocking         : If true, this function should wait for the transfer to complete.
@@ -240,7 +251,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self, endpoint_number: int, data: bytes, blocking: bool = True
     ):
         """
-        Sends a collection of USB data on a given endpoint.
+        Sends data on a given IN endpoint.
 
         Args:
             endpoint_number : The number of the IN endpoint on which data should be sent.
@@ -248,7 +259,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             blocking : Wait for sending. Must be true for control.
         """
         if not isinstance(data, (bytes, bytearray)):
-            raise TypeError(f" {type(data)=}, must be bytes")
+            raise TypeError(f"{type(data)=}, must be bytes")
 
         assert endpoint_number != 0, "send_on_endpoint called for control endpoint"
 
@@ -266,8 +277,17 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         blocking: bool = False,
     ):
         """
-        This is only called by the proxy and only for OUT requests.
-        Other acks call send_on_control_endpoint.
+        Supposed to be used to acknowledge control requests. But only called
+        by the proxy and only for OUT requests; other requests are acknowledged
+        via send_on_control_endpoint.
+
+        Args:
+            direction : Determines if we're ACK'ing an IN or OUT vendor request.
+                        (This should match the direction of the DATA stage.)
+            endpoint_number : The endpoint number on which the control request
+                              occurred.
+            blocking : True if we should wait for the ACK to be fully issued
+                       before returning.
         """
         if not self.unacked_request:
             log.debug("ignoring ack_status_stage for already acked OUT request")
@@ -280,7 +300,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self, endpoint_number: int, direction: USBDirection = USBDirection.OUT
     ):
         """
-        Stalls the provided endpoint, as defined in the USB spec.
+        Stalls the provided endpoint.
 
         Args:
             endpoint_number : The number of the endpoint to be stalled.
@@ -294,11 +314,11 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             # Raw Gadget does support stalling non-control endpoints, but none
             # of the Facedancer examples do this. Thus, testing this feature is
             # hard, so leave this as not implemented.
-            raise NotImplementedError()
+            raise NotImplementedError
 
     def service_irqs(self):
         """
-        Core event loop - reacts to events from the host via the rawgadget API.
+        Core event loop. Reacts to events recevied via Raw Gadget from the host.
         """
         try:
             event = self.queue.get_nowait()
@@ -335,10 +355,9 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             case usb_raw_event_type.USB_RAW_EVENT_CONTROL:
                 self._handle_control_event(data)
             case usb_raw_event_type.USB_RAW_EVENT_DISCONNECT:
-                # For an unclear reason, some UDC drivers issue a disconnect
-                # event when the device is being reconfigured. Thus, treat
-                # disconnect as reset.
-                log.info("gadget disable")
+                # Some UDC drivers (e.g. dwc2) issue a disconnect event when the
+                # device is being reconfigured. Thus, treat disconnect as reset.
+                log.info("gadget reset (disconnected)")
                 self._reset()
             case usb_raw_event_type.USB_RAW_EVENT_SUSPEND:
                 log.info("gadget suspended")
@@ -353,7 +372,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 # Raw Gadget might be extended and start reporting other kinds
                 # of events. Instead of ignoring these events, raise an
                 # exception to hint that this backend must be extended as well.
-                raise NotImplementedError()
+                raise NotImplementedError
 
     def _handle_control_event(self, data: bytes):
         req: USBControlRequest = self.connected_device.create_request(data)
@@ -432,7 +451,12 @@ class EpReadEvent:
 
 
 class ControlHandler:
-    """Send and receive raw gadget control events that can block."""
+    """
+    Handler for the Raw Gadget events, including the control requests.
+
+    Spawns a thread for fetching Raw Gadget events, as the Raw Gadget API
+    for this is blocking.
+    """
 
     def __init__(self, backend):
         self.backend = backend
@@ -458,7 +482,6 @@ class ControlHandler:
         self.backend.device.ep0_write(data)
 
     def _gadget_loop(self):
-        """Handle blocking calls to raw-gadget API in background."""
         while not self.stopped.is_set():
             try:
                 event = self.backend.device.event_fetch()
@@ -475,14 +498,6 @@ class EndpointHandler:
     ep: USBEndpoint
     backend: RawGadgetBackend
 
-    # We could validate the endpoint descriptor against the UDC
-    # endpoint capabilities and the selected USB device speed.
-    # This will, however, limit the ability to emulate devices
-    # that do not strictly follow the USB specifications;
-    # some UDCs unofficially support this. As having this ability
-    # might be useful for fuzzing, use the endpoint descriptor as
-    # is. As a trade off, this might lead to unpredictable errors
-    # during the device emulation.
     def __init__(self, ep, backend):
         self.ep = ep
         self.backend = backend
@@ -491,12 +506,18 @@ class EndpointHandler:
             target=self._gadget_loop, name=f"ep-{self.ep.number}", daemon=True
         )
 
+        # We could validate the endpoint descriptor against the UDC endpoint
+        # capabilities and the selected USB device speed. This will, however,
+        # limit the ability to emulate devices that do not strictly follow the
+        # USB specifications; some UDCs unofficially support this. As having
+        # this ability might be useful for fuzzing, use the endpoint descriptor
+        # as is. As a trade off, this might lead to unpredictable errors during
+        # the device emulation.
         self._handle = self.backend.device.ep_enable(ep.get_descriptor())
         log.info(f"ep_enable: {ep} (handle={self._handle})")
 
     def _gadget_loop(self):
-        """Handle blocking calls to raw-gadget API in background."""
-        ...
+        raise NotImplementedError
 
     def start(self):
         self._gadget_thread.start()
@@ -512,7 +533,13 @@ class EndpointHandler:
 
 
 class EndpointOutHandler(EndpointHandler):
-    """Read OUT transfers from the host and report them to the core Facedancer code."""
+    """
+    Handler for non-control OUT endpoints.
+
+    Spawns a thread for reading data from the endpoint, as the Raw Gadget API
+    for this is blocking. Passes read data to the main thread to be reported
+    to the emulated device.
+    """
 
     def _gadget_loop(self):
         while not self.stopped.is_set():
@@ -535,7 +562,16 @@ class EndpointOutHandler(EndpointHandler):
 
 
 class EndpointInHandler(EndpointHandler):
-    """Read IN transfers from the core Facedancer code and send to the host."""
+    """
+    Handler for non-control IN endpoints.
+
+    Spawns a thread to fetching data to be written from the emulated device,
+    as the emulated device might be a proxy and thus block for some time.
+
+    Spawns another thread for writing data to the endpoint, as the Raw Gadget
+    API for this is blocking and the host might not read out the data right
+    away (observed when running the Facedancer tests).
+    """
 
     def start(self):
         self._queue = Queue()
@@ -582,14 +618,11 @@ class EndpointInHandler(EndpointHandler):
         log.debug(f"ep-{self.ep.number}-gadget stopped")
 
     def _recv_loop(self):
-        """Read data from device.
-
-        The emulated device will call backend.send_on_endpoint()
-        which will call self.send().
-        """
         while not self.stopped.is_set():
             # Avoid calling handle_data_requested() while ep_write() is blocked.
             if self._ep_idle.wait(timeout=self.ep.interval * 0.001):
+                # This will likely make the emulated device call
+                # backend.send_on_endpoint(), which will in turn call self.send().
                 self.backend.connected_device.handle_data_requested(self.ep)
 
             # Either handle_data_requested() might have sent data on the endpoint
