@@ -14,10 +14,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import fcntl
 import os
+import time
+
 from threading import Thread
 from signal import signal, SIGUSR1, pthread_kill
-
-from queue import Queue
+from queue import Queue, Empty
 
 from construct import (
     Bit,
@@ -291,7 +292,12 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         """
         Core event loop - reacts to events from the host via the rawgadget API.
         """
-        event = self.queue.get()
+        try:
+            event = self.queue.get_nowait()
+        except Empty:
+            # No events, yield to other threads.
+            time.sleep(0)
+            return
         match event:
             case RawGadgetEvent(kind, data):
                 self._handle_raw_gadget_event(kind, data)
