@@ -75,7 +75,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             verbose : The verbosity level of the given application. (Optional)
             quirks  : Unused
         """
-        super().__init__(device or RawGadget(verbose), verbose)
+        super().__init__(device or RawGadget(), verbose)
 
         self.queue = Queue(100)
         self.eps = {}
@@ -147,7 +147,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             log.info(f"Overriding device speed with RG_USB_SPEED={speed_override}")
             device_speed = DeviceSpeed(speed_override)
 
-        self.device.run(
+        self.device.init_and_run(
             udc_driver=os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower(),
             udc_device=os.environ.get("RG_UDC_DEVICE", "dummy_udc.0").lower(),
             speed=device_speed,
@@ -361,10 +361,10 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             log.debug(f"recv control {req}")
 
         if req.direction == USBDirection.OUT and req.length > 0:
-            rv, ep_request = self.control.read(req.length)
+            rv, data = self.control.read(req.length)
             self.unacked_request = None
-            assert ep_request and rv == req.length
-            req.data = bytes(ep_request.data)
+            assert data and rv == req.length
+            req.data = bytes(data)
             if self.verbose > 3:
                 log.debug(f"  data {data.hex(' ', -2)}")
         else:
@@ -461,7 +461,9 @@ usb_raw_event_type = Enum(
 )
 
 usb_raw_event = Struct(
-    "kind" / usb_raw_event_type, "length" / Int32un, "data" / TrailingBytes(this.length)
+    "kind" / usb_raw_event_type,
+    "length" / Int32un,
+    "data" / TrailingBytes(this.length)
 )
 
 usb_raw_ep_io = Struct(
@@ -543,7 +545,6 @@ class IOCTLRequest:
             req = IOCTLRequest.IOC(dir, typ, nr, size)
             if isinstance(arg, bytes):
                 arg = bytearray(arg)
-
             rv = fcntl.ioctl(fd, req, arg, True)
             return rv, arg
 
@@ -570,10 +571,8 @@ class RawGadgetRequests(IOCTLRequest):
 
 
 class RawGadget:
-    def __init__(self, verbose):
+    def __init__(self):
         self.fd = None
-        self.last_ep_addr = 0
-        self.verbose = verbose
 
     def open(self):
         self.fd = open("/dev/raw-gadget", "bw")
@@ -583,13 +582,9 @@ class RawGadget:
         self.fd.close()
         self.fd = None
 
-    def run(self, udc_driver, udc_device, speed: DeviceSpeed):
+    def init_and_run(self, udc_driver, udc_device, speed: DeviceSpeed):
         arg = usb_raw_init.build(
-            {
-                "driver_name": udc_driver,
-                "device_name": udc_device,
-                "speed": speed,
-            }
+            {"driver_name": udc_driver, "device_name": udc_device, "speed": speed}
         )
         RawGadgetRequests.USB_RAW_IOCTL_INIT(self.fd, arg)
         RawGadgetRequests.USB_RAW_IOCTL_RUN(self.fd)
@@ -597,9 +592,7 @@ class RawGadget:
     def event_fetch(self, data):
         arg = usb_raw_event.build({"kind": 0, "length": len(data), "data": data})
         _, data = RawGadgetRequests.USB_RAW_IOCTL_EVENT_FETCH(self.fd, arg)
-
-        raw = usb_raw_event.parse(data)
-        return RawGadgetEvent(raw.kind, raw.data)
+        return usb_raw_event.parse(data)
 
     def ep0_write(self, data, flags=0):
         arg = usb_raw_ep_io.build(
@@ -607,48 +600,33 @@ class RawGadget:
         )
         RawGadgetRequests.USB_RAW_IOCTL_EP0_WRITE(self.fd, arg)
 
-    def ep0_read(self, data, flags=0):
+    def ep0_read(self, length, flags=0):
         arg = usb_raw_ep_io.build(
-            {"ep": 0, "flags": flags, "length": len(data), "data": data}
+            {"ep": 0, "flags": flags, "length": length, "data": bytes(length)}
         )
         rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP0_READ(self.fd, arg)
-
-        return rv, usb_raw_ep_io.parse(data)
+        return rv, usb_raw_ep_io.parse(data).data
 
     def ep_enable(self, ep_desc):
         handle, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_ENABLE(self.fd, ep_desc)
-        log.info(f"ep_enable: {handle=}")
         return handle
 
     def ep_disable(self, handle: int):
         RawGadgetRequests.USB_RAW_IOCTL_EP_DISABLE(self.fd, handle)
-        log.info(f"ep_disable: {handle=}")
 
     def ep_write(self, handle, data, flags=0):
         arg = usb_raw_ep_io.build(
             {"ep": handle, "flags": flags, "length": len(data), "data": data}
         )
         rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
-        if rv != len(data) and self.verbose > 2:
-            log.warning(f"ep_write {handle=} length={len(data)} {rv=}")
-        elif self.verbose > 4:
-            log.debug(f"ep_write: {handle=} {flags=} {rv=}")
+        return rv
 
     def ep_read(self, handle, length, flags=0):
         arg = usb_raw_ep_io.build(
             {"ep": handle, "flags": flags, "length": length, "data": bytes(length)}
         )
-        try:
-            rv, arg = RawGadgetRequests.USB_RAW_IOCTL_EP_READ(self.fd, arg)
-        except TimeoutError:
-            if self.verbose > 4:
-                log.debug(f"Timeout: ep_read {handle=}")
-            return None
-
-        if self.verbose > 3:
-            log.debug(f"ep_read: {handle=} {flags=} {length=} {rv=}")
-
-        return usb_raw_ep_io.parse(arg).data[:rv]
+        rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP_READ(self.fd, arg)
+        return usb_raw_ep_io.parse(data).data[:rv]
 
     def configure(self):
         RawGadgetRequests.USB_RAW_IOCTL_CONFIGURE(self.fd)
@@ -697,7 +675,7 @@ class ControlHandler:
     def read(self, length: int):
         if self.backend.verbose > 2:
             log.info(f"read ep0 {length=}")
-        return self.backend.device.ep0_read(bytearray(length))
+        return self.backend.device.ep0_read(length)
 
     def send(self, data: bytes):
         if self.backend.verbose > 2:
@@ -713,7 +691,7 @@ class ControlHandler:
                 continue
 
             if event is not None:
-                self.backend.queue.put(event)
+                self.backend.queue.put(RawGadgetEvent(event.kind, event.data))
 
         log.debug("control loop done")
 
@@ -739,7 +717,7 @@ class EndpointHandler:
         )
 
         self._handle = self.backend.device.ep_enable(ep.get_descriptor())
-        log.debug(f"enable {ep} ({ep.address}) handle={self._handle}")
+        log.info(f"ep_enable: {ep} (handle={self._handle})")
 
     def _gadget_loop(self):
         """Handle blocking calls to raw-gadget API in background."""
@@ -754,11 +732,8 @@ class EndpointHandler:
         # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
         pthread_kill(self._gadget_thread.ident, SIGUSR1)
         self._gadget_thread.join()
-
-        try:
-            self.backend.device.ep_disable(self._handle)
-        except Exception as e:
-            log.warning(f"disable {self.ep}: {e}")
+        self.backend.device.ep_disable(self._handle)
+        log.info(f"ep_disable: {self.ep} (handle={self._handle})")
 
 
 class EndpointOutHandler(EndpointHandler):
@@ -770,6 +745,7 @@ class EndpointOutHandler(EndpointHandler):
                 data = self.backend.device.ep_read(
                     self._handle, self.ep.max_packet_size
                 )
+                log.debug(f"ep_read: handle={self._handle=} len={len(data)=}")
             except (InterruptedError, BrokenPipeError):
                 continue
 
@@ -815,7 +791,11 @@ class EndpointInHandler(EndpointHandler):
                     log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
                 if not self.stopped.is_set():
                     self._ep_idle.clear()
-                    self.backend.device.ep_write(self._handle, data)
+                    rv = self.backend.device.ep_write(self._handle, data)
+                    if rv != len(data):
+                        log.warning(f"ep_write: handle={self._handle=} len={len(data)} actual={rv=}")
+                    else:
+                        log.debug(f"ep_write: handle={self._handle=} len={rv=}")
                     self._ep_idle.set()
                 self._queue.task_done()
             except (InterruptedError, BrokenPipeError):
