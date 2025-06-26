@@ -607,17 +607,14 @@ class RawGadget:
         log.info(f"ep_disable: {handle=}")
 
     def ep_write(self, handle, data, flags=0):
-        while data:
-            arg = usb_raw_ep_io.build(
-                {"ep": handle, "flags": flags, "length": len(data), "data": data}
-            )
-            rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
-            if rv != len(data) and self.verbose > 2:
-                log.warning(f"ep_write {handle=} length={len(data)} {rv=}")
-            elif self.verbose > 4:
-                log.debug(f"ep_write: {handle=} {flags=} {rv=}")
-
-            data = data[rv:]
+        arg = usb_raw_ep_io.build(
+            {"ep": handle, "flags": flags, "length": len(data), "data": data}
+        )
+        rv, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_WRITE(self.fd, arg)
+        if rv != len(data) and self.verbose > 2:
+            log.warning(f"ep_write {handle=} length={len(data)} {rv=}")
+        elif self.verbose > 4:
+            log.debug(f"ep_write: {handle=} {flags=} {rv=}")
 
     def ep_read(self, handle, length, flags=0):
         arg = usb_raw_ep_io.build(
