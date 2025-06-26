@@ -9,15 +9,16 @@ Authors:
 - Devin Bayer <dev@doubly.so>
 """
 
+# Allow using forward type references in Python 3.10+.
 from __future__ import annotations
 
-from dataclasses import dataclass
 import fcntl
 import os
 import time
 
-from threading import Thread, Event
+from dataclasses import dataclass
 from signal import signal, SIGUSR1, pthread_kill
+from threading import Thread, Event
 from queue import Queue, Empty
 
 from construct import (
@@ -37,17 +38,16 @@ from construct import (
     this,
 )
 
-from facedancer.device import USBDevice
-from facedancer.endpoint import USBEndpoint
-from facedancer.request import USBControlRequest
-from facedancer.types import (
+from ..core import FacedancerApp
+from ..device import USBDevice
+from ..endpoint import USBEndpoint
+from ..request import USBControlRequest
+from ..types import (
     DeviceSpeed,
     USBDirection,
     USBRequestRecipient,
     USBStandardRequests,
 )
-from facedancer.core import FacedancerApp
-
 from ..logging import log
 from .base import FacedancerBackend
 
