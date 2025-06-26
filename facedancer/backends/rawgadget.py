@@ -800,7 +800,7 @@ class RawGadget:
         handle, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_ENABLE(self.fd, ep_desc)
         return handle
 
-    def ep_disable(self, handle: int):
+    def ep_disable(self, handle):
         RawGadgetRequests.USB_RAW_IOCTL_EP_DISABLE(self.fd, handle)
 
     def ep_write(self, handle, data, flags=0):
