@@ -136,8 +136,10 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         if self.verbose > 0:
             log.info("connecting device: %s (%r)", usb_device.name, device_speed)
 
-        # use SIGUSR1 to interrupt waiting for ioctl to /dev/raw-gadget
-        self._old_signal_handler = signal(SIGUSR1, self._ignore_signal)
+        # Set a no-op handler for SIGUSR1. Sending this signal to the threads
+        # that handle enpoints will thus allows interrupting blocking Raw Gadget
+        # ioctl calls without other side-effects.
+        self._original_signal_handler = signal(SIGUSR1, self._ignore_signal)
 
         self.connected_device = usb_device
 
@@ -150,6 +152,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             udc_device=os.environ.get("RG_UDC_DEVICE", "dummy_udc.0").lower(),
             speed=device_speed,
         )
+
         self.control = ControlHandler(self)
 
     def disconnect(self):
@@ -159,8 +162,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.control.stop()
         self.device.close()
 
-        # use SIGUSR1 to interrupt waiting for ioctl to /dev/raw-gadget
-        signal(SIGUSR1, self._old_signal_handler)
+        # Restore the original SIGUSR1 handler.
+        signal(SIGUSR1, self._original_signal_handler)
 
         if self.verbose > 0:
             log.info("disconnected device: %s", self.connected_device.name)
@@ -687,6 +690,7 @@ class ControlHandler:
     def stop(self):
         log.debug(f"ctrl stopping, thread {self._thread.ident}")
         self.stopped.set()
+        # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
         pthread_kill(self._thread.ident, SIGUSR1)
         self._thread.join()
 
@@ -747,8 +751,7 @@ class EndpointHandler:
     def stop(self):
         log.debug(f"ep-{self.ep.number} stopping")
         self.stopped.set()
-
-        # we must interrupt blocking ep_read / ep_write calls before ep_disable
+        # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
         pthread_kill(self._gadget_thread.ident, SIGUSR1)
         self._gadget_thread.join()
 
