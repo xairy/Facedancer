@@ -158,7 +158,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     def disconnect(self):
         """Disconnects Facedancer from the target host."""
         assert self.connected_device
-        self._disable()
+        self._disable_endpoints()
         self.control.stop()
         self.device.close()
 
@@ -192,7 +192,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         log.info("applying configuration")
         self.validate_configuration(configuration)
 
-        self._disable()
+        self._disable_endpoints()
 
         self.device.vbus_draw(configuration.max_power // 2)
         self.device.configure()
@@ -201,7 +201,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.is_configured = True
 
         # TODO: Double check that endpoint threads need to be spawned before the SET_CONFIGURATION request is acked
-        self._enable()
+        self._enable_endpoints()
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
         """
@@ -308,7 +308,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             return
         match event:
             case RawGadgetEvent(kind, data):
-                self._handle_raw_gadget_event(kind, data)
+                self._handle_event(kind, data)
             case EpReadEvent(ep, handler, data):
                 if handler.stopped.is_set():
                     log.debug(f"discarding event {event} from stopped handler")
@@ -317,10 +317,11 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             case _:
                 assert False
 
-    ##############################################################################
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
     # Internal functions
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-    def _handle_raw_gadget_event(self, kind, data):
+    def _handle_event(self, kind, data):
         if self.verbose > 4:
             log.debug(f"recv event {kind} len={len(data)}")
 
@@ -332,7 +333,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 # capabilities against the device endpoint descriptors.
                 self.eps_info = self.device.eps_info()
             case usb_raw_event_type.USB_RAW_EVENT_CONTROL:
-                self._recv_control(data)
+                self._handle_control_event(data)
             case usb_raw_event_type.USB_RAW_EVENT_DISCONNECT:
                 # For an unclear reason, some UDC drivers issue a disconnect
                 # event when the device is being reconfigured. Thus, treat
@@ -354,7 +355,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 # exception to hint that this backend must be extended as well.
                 raise NotImplementedError()
 
-    def _recv_control(self, data: bytes):
+    def _handle_control_event(self, data: bytes):
         req: USBControlRequest = self.connected_device.create_request(data)
 
         if self.verbose > 2:
@@ -378,23 +379,23 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             log.info(f"gadget set interface {req.index} alt {req.value}")
             reenable = True
 
-        # TODO - only disable handlers for the target interface
+        # TODO: Only reenable endpoints for the interface whose altsetting is being changed.
         if reenable:
-            self._disable()
+            self._disable_endpoints()
 
         self.connected_device.handle_request(req)
 
         if reenable:
-            self._enable()
+            self._enable_endpoints()
 
     def _reset(self):
         self.is_configured = False
-        self._disable()
+        self._disable_endpoints()
 
         if self.connected_device:
             self.connected_device.handle_bus_reset()
 
-    def _enable(self):
+    def _enable_endpoints(self):
         if not self.is_configured:
             return
 
@@ -407,7 +408,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
                 self.eps[ep.address].start()
 
-    def _disable(self):
+    def _disable_endpoints(self):
         for ep in self.eps.values():
             ep.stop()
 
