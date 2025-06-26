@@ -589,8 +589,11 @@ class RawGadget:
         RawGadgetRequests.USB_RAW_IOCTL_INIT(self.fd, arg)
         RawGadgetRequests.USB_RAW_IOCTL_RUN(self.fd)
 
-    def event_fetch(self, data):
-        arg = usb_raw_event.build({"kind": 0, "length": len(data), "data": data})
+    def event_fetch(self):
+        length = usb_ctrlrequest.sizeof()
+        arg = usb_raw_event.build(
+            {"kind": 0, "length": length, "data": bytes(length)}
+        )
         _, data = RawGadgetRequests.USB_RAW_IOCTL_EVENT_FETCH(self.fd, arg)
         return usb_raw_event.parse(data)
 
@@ -605,7 +608,7 @@ class RawGadget:
             {"ep": 0, "flags": flags, "length": length, "data": bytes(length)}
         )
         rv, data = RawGadgetRequests.USB_RAW_IOCTL_EP0_READ(self.fd, arg)
-        return rv, usb_raw_ep_io.parse(data).data
+        return rv, usb_raw_ep_io.parse(data).data[:rv]
 
     def ep_enable(self, ep_desc):
         handle, _ = RawGadgetRequests.USB_RAW_IOCTL_EP_ENABLE(self.fd, ep_desc)
@@ -686,7 +689,7 @@ class ControlHandler:
         """Handle blocking calls to raw-gadget API in background."""
         while not self.stopped.is_set():
             try:
-                event = self.backend.device.event_fetch(bytes(usb_ctrlrequest.sizeof()))
+                event = self.backend.device.event_fetch()
             except InterruptedError:
                 continue
 
