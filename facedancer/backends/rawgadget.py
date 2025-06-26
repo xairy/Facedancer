@@ -109,6 +109,14 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     def get_version(self):
         raise NotImplementedError
 
+    def requires_packetizing(self):
+        """
+        Tells whether the backend requires the data to be split into chunks
+        of max packet size when sending this data on an endpoint.
+        """
+        # Raw Gadget packetizes data internally.
+        return False
+
     def connect(
         self,
         usb_device: USBDevice,
