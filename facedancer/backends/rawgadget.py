@@ -140,6 +140,11 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self._old_signal_handler = signal(SIGUSR1, self._ignore_signal)
 
         self.connected_device = usb_device
+
+        if speed_override := int(os.environ.get("RG_USB_SPEED", 0)):
+            log.info(f"Overriding device speed with RG_USB_SPEED={speed_override}")
+            device_speed = DeviceSpeed(speed_override)
+
         self.device.run(
             udc_driver=os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower(),
             udc_device=os.environ.get("RG_UDC_DEVICE", "dummy_udc.0").lower(),
@@ -576,10 +581,6 @@ class RawGadget:
         self.fd = None
 
     def run(self, udc_driver, udc_device, speed: DeviceSpeed):
-        if override := int(os.environ.get("RG_USB_SPEED", 0)):
-            log.info(f"Overriding device speed with RG_USB_SPEED={override}")
-            speed = DeviceSpeed(override)
-
         arg = usb_raw_init.build(
             {
                 "driver_name": udc_driver,
