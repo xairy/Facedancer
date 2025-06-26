@@ -417,6 +417,192 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         log.debug(f"ignoring signal {signum}")
 
 
+@dataclass
+class RawGadgetEvent:
+    kind: int
+    data: bytes
+
+
+@dataclass
+class EpReadEvent:
+    ep: USBEndpoint
+    handler: EndpointHandler
+    data: bytes
+
+
+class ControlHandler:
+    """Send and receive raw gadget control events that can block."""
+
+    def __init__(self, backend):
+        self.backend = backend
+        self.stopped = Event()
+        self._thread = Thread(target=self._gadget_loop, name="ctrl", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        log.debug(f"ctrl stopping, thread {self._thread.ident}")
+        self.stopped.set()
+        # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
+        pthread_kill(self._thread.ident, SIGUSR1)
+        self._thread.join()
+
+    def read(self, length: int):
+        if self.backend.verbose > 2:
+            log.info(f"read ep0 {length=}")
+        return self.backend.device.ep0_read(length)
+
+    def send(self, data: bytes):
+        if self.backend.verbose > 2:
+            log.info(f"send ep0 {data.hex(' ', -2)}")
+        self.backend.device.ep0_write(data)
+
+    def _gadget_loop(self):
+        """Handle blocking calls to raw-gadget API in background."""
+        while not self.stopped.is_set():
+            try:
+                event = self.backend.device.event_fetch()
+            except InterruptedError:
+                continue
+
+            if event is not None:
+                self.backend.queue.put(RawGadgetEvent(event.kind, event.data))
+
+        log.debug("control loop done")
+
+
+class EndpointHandler:
+    ep: USBEndpoint
+    backend: RawGadgetBackend
+
+    # We could validate the endpoint descriptor against the UDC
+    # endpoint capabilities and the selected USB device speed.
+    # This will, however, limit the ability to emulate devices
+    # that do not strictly follow the USB specifications;
+    # some UDCs unofficially support this. As having this ability
+    # might be useful for fuzzing, use the endpoint descriptor as
+    # is. As a trade off, this might lead to unpredictable errors
+    # during the device emulation.
+    def __init__(self, ep, backend):
+        self.ep = ep
+        self.backend = backend
+        self.stopped = Event()
+        self._gadget_thread = Thread(
+            target=self._gadget_loop, name=f"ep-{self.ep.number}", daemon=True
+        )
+
+        self._handle = self.backend.device.ep_enable(ep.get_descriptor())
+        log.info(f"ep_enable: {ep} (handle={self._handle})")
+
+    def _gadget_loop(self):
+        """Handle blocking calls to raw-gadget API in background."""
+        ...
+
+    def start(self):
+        self._gadget_thread.start()
+
+    def stop(self):
+        log.debug(f"ep-{self.ep.number} stopping")
+        self.stopped.set()
+        # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
+        pthread_kill(self._gadget_thread.ident, SIGUSR1)
+        self._gadget_thread.join()
+        self.backend.device.ep_disable(self._handle)
+        log.info(f"ep_disable: {self.ep} (handle={self._handle})")
+
+
+class EndpointOutHandler(EndpointHandler):
+    """Read OUT transfers from the host and report them to the core Facedancer code."""
+
+    def _gadget_loop(self):
+        while not self.stopped.is_set():
+            try:
+                # TODO: We should be able to use 4096 instead of max_packet_size,
+                # but tests fail for an unknown reason. Investigate.
+                data = self.backend.device.ep_read(
+                    self._handle, self.ep.max_packet_size
+                )
+                log.debug(f"ep_read: handle={self._handle=} len={len(data)=}")
+            except (InterruptedError, BrokenPipeError):
+                continue
+
+            if data is not None:
+                event = EpReadEvent(ep=self.ep, handler=self, data=data)
+                self.backend.queue.put(event)
+
+        log.debug(f"ep-{self.ep.number} stopped")
+
+
+
+class EndpointInHandler(EndpointHandler):
+    """Read IN transfers from the core Facedancer code and send to the host."""
+
+    def start(self):
+        self._queue = Queue()
+        self._ep_idle = Event()
+        self._ep_idle.set()
+        self._recv_thread = Thread(
+            target=self._recv_loop, name=f"ep-{self.ep.number}", daemon=True
+        )
+        self._recv_thread.start()
+        super().start()
+
+    def stop(self):
+        self._queue.put(None)
+        super().stop()
+        self._recv_thread.join()
+
+    def send(self, data: bytes, blocking: bool):
+        self._queue.put(data)
+        if blocking:
+            self._queue.join()
+
+    def _gadget_loop(self):
+        while not self.stopped.is_set():
+            try:
+                data = self._queue.get()
+                if data is None or self.stopped.is_set():
+                    break
+
+                if self.backend.verbose > 3:
+                    log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
+                if not self.stopped.is_set():
+                    self._ep_idle.clear()
+                    rv = self.backend.device.ep_write(self._handle, data)
+                    if rv != len(data):
+                        log.warning(f"ep_write: handle={self._handle=} len={len(data)} actual={rv=}")
+                    else:
+                        log.debug(f"ep_write: handle={self._handle=} len={rv=}")
+                    self._ep_idle.set()
+                self._queue.task_done()
+            except (InterruptedError, BrokenPipeError):
+                self._ep_idle.clear()
+                continue
+
+        log.debug(f"ep-{self.ep.number}-gadget stopped")
+
+    def _recv_loop(self):
+        """Read data from device.
+
+        The emulated device will call backend.send_on_endpoint()
+        which will call self.send().
+        """
+        while not self.stopped.is_set():
+            # Avoid calling handle_data_requested() while ep_write() is blocked.
+            if self._ep_idle.wait(timeout=self.ep.interval * 0.001):
+                self.backend.connected_device.handle_data_requested(self.ep)
+
+            # Either handle_data_requested() might have sent data on the endpoint
+            # or ep_write() is blocked. Yield the execution to other threads.
+            time.sleep(0)
+
+        log.debug(f"ep-{self.ep.number}-recv stopped")
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Raw Gadget API wrapper
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+
 class TrailingBytes(Bytes):
     def _sizeof(self, context, path):
         return 0
@@ -644,184 +830,3 @@ class RawGadget:
 
     def ep0_stall(self):
         RawGadgetRequests.USB_RAW_IOCTL_EP0_STALL(self.fd)
-
-
-@dataclass
-class RawGadgetEvent:
-    kind: int
-    data: bytes
-
-
-@dataclass
-class EpReadEvent:
-    ep: USBEndpoint
-    handler: EndpointHandler
-    data: bytes
-
-
-class ControlHandler:
-    """Send and receive raw gadget control events that can block."""
-
-    def __init__(self, backend):
-        self.backend = backend
-        self.stopped = Event()
-        self._thread = Thread(target=self._gadget_loop, name="ctrl", daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        log.debug(f"ctrl stopping, thread {self._thread.ident}")
-        self.stopped.set()
-        # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
-        pthread_kill(self._thread.ident, SIGUSR1)
-        self._thread.join()
-
-    def read(self, length: int):
-        if self.backend.verbose > 2:
-            log.info(f"read ep0 {length=}")
-        return self.backend.device.ep0_read(length)
-
-    def send(self, data: bytes):
-        if self.backend.verbose > 2:
-            log.info(f"send ep0 {data.hex(' ', -2)}")
-        self.backend.device.ep0_write(data)
-
-    def _gadget_loop(self):
-        """Handle blocking calls to raw-gadget API in background."""
-        while not self.stopped.is_set():
-            try:
-                event = self.backend.device.event_fetch()
-            except InterruptedError:
-                continue
-
-            if event is not None:
-                self.backend.queue.put(RawGadgetEvent(event.kind, event.data))
-
-        log.debug("control loop done")
-
-
-class EndpointHandler:
-    ep: USBEndpoint
-    backend: RawGadgetBackend
-
-    # We could validate the endpoint descriptor against the UDC
-    # endpoint capabilities and the selected USB device speed.
-    # This will, however, limit the ability to emulate devices
-    # that do not strictly follow the USB specifications;
-    # some UDCs unofficially support this. As having this ability
-    # might be useful for fuzzing, use the endpoint descriptor as
-    # is. As a trade off, this might lead to unpredictable errors
-    # during the device emulation.
-    def __init__(self, ep, backend):
-        self.ep = ep
-        self.backend = backend
-        self.stopped = Event()
-        self._gadget_thread = Thread(
-            target=self._gadget_loop, name=f"ep-{self.ep.number}", daemon=True
-        )
-
-        self._handle = self.backend.device.ep_enable(ep.get_descriptor())
-        log.info(f"ep_enable: {ep} (handle={self._handle})")
-
-    def _gadget_loop(self):
-        """Handle blocking calls to raw-gadget API in background."""
-        ...
-
-    def start(self):
-        self._gadget_thread.start()
-
-    def stop(self):
-        log.debug(f"ep-{self.ep.number} stopping")
-        self.stopped.set()
-        # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
-        pthread_kill(self._gadget_thread.ident, SIGUSR1)
-        self._gadget_thread.join()
-        self.backend.device.ep_disable(self._handle)
-        log.info(f"ep_disable: {self.ep} (handle={self._handle})")
-
-
-class EndpointOutHandler(EndpointHandler):
-    """Read OUT transfers from the host and report them to the core Facedancer code."""
-
-    def _gadget_loop(self):
-        while not self.stopped.is_set():
-            try:
-                # TODO: We should be able to use 4096 instead of max_packet_size,
-                # but tests fail for an unknown reason. Investigate.
-                data = self.backend.device.ep_read(
-                    self._handle, self.ep.max_packet_size
-                )
-                log.debug(f"ep_read: handle={self._handle=} len={len(data)=}")
-            except (InterruptedError, BrokenPipeError):
-                continue
-
-            if data is not None:
-                event = EpReadEvent(ep=self.ep, handler=self, data=data)
-                self.backend.queue.put(event)
-
-        log.debug(f"ep-{self.ep.number} stopped")
-
-
-
-class EndpointInHandler(EndpointHandler):
-    """Read IN transfers from the core Facedancer code and send to the host."""
-
-    def start(self):
-        self._queue = Queue()
-        self._ep_idle = Event()
-        self._ep_idle.set()
-        self._recv_thread = Thread(
-            target=self._recv_loop, name=f"ep-{self.ep.number}", daemon=True
-        )
-        self._recv_thread.start()
-        super().start()
-
-    def stop(self):
-        self._queue.put(None)
-        super().stop()
-        self._recv_thread.join()
-
-    def send(self, data: bytes, blocking: bool):
-        self._queue.put(data)
-        if blocking:
-            self._queue.join()
-
-    def _gadget_loop(self):
-        while not self.stopped.is_set():
-            try:
-                data = self._queue.get()
-                if data is None or self.stopped.is_set():
-                    break
-
-                if self.backend.verbose > 3:
-                    log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
-                if not self.stopped.is_set():
-                    self._ep_idle.clear()
-                    rv = self.backend.device.ep_write(self._handle, data)
-                    if rv != len(data):
-                        log.warning(f"ep_write: handle={self._handle=} len={len(data)} actual={rv=}")
-                    else:
-                        log.debug(f"ep_write: handle={self._handle=} len={rv=}")
-                    self._ep_idle.set()
-                self._queue.task_done()
-            except (InterruptedError, BrokenPipeError):
-                self._ep_idle.clear()
-                continue
-
-        log.debug(f"ep-{self.ep.number}-gadget stopped")
-
-    def _recv_loop(self):
-        """Read data from device.
-
-        The emulated device will call backend.send_on_endpoint()
-        which will call self.send().
-        """
-        while not self.stopped.is_set():
-            # Avoid calling handle_data_requested() while ep_write() is blocked.
-            if self._ep_idle.wait(timeout=self.ep.interval * 0.001):
-                self.backend.connected_device.handle_data_requested(self.ep)
-
-            # Either handle_data_requested() might have sent data on the endpoint
-            # or ep_write() is blocked. Yield the execution to other threads.
-            time.sleep(0)
-
-        log.debug(f"ep-{self.ep.number}-recv stopped")
