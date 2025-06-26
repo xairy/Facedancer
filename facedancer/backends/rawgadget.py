@@ -302,7 +302,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             case RawGadgetEvent(kind, data):
                 self._handle_raw_gadget_event(kind, data)
             case EpReadEvent(ep, handler, data):
-                if handler.stopped:
+                if handler.stopped.is_set():
                     log.debug(f"discarding event {event} from stopped handler")
                     return
                 self.connected_device.handle_data_received(ep, data)
@@ -679,13 +679,13 @@ class ControlHandler:
 
     def __init__(self, backend):
         self.backend = backend
-        self.stopped = False
+        self.stopped = Event()
         self._thread = Thread(target=self._gadget_loop, name="ctrl", daemon=True)
         self._thread.start()
 
     def stop(self):
         log.debug(f"ctrl stopping, thread {self._thread.ident}")
-        self.stopped = True
+        self.stopped.set()
         pthread_kill(self._thread.ident, SIGUSR1)
         self._thread.join()
 
@@ -701,7 +701,7 @@ class ControlHandler:
 
     def _gadget_loop(self):
         """Handle blocking calls to raw-gadget API in background."""
-        while not self.stopped:
+        while not self.stopped.is_set():
             try:
                 event = self.backend.device.event_fetch(bytes(usb_ctrlrequest.sizeof()))
             except InterruptedError:
@@ -728,7 +728,7 @@ class EndpointHandler:
     def __init__(self, ep, backend):
         self.ep = ep
         self.backend = backend
-        self.stopped = False
+        self.stopped = Event()
         self._gadget_thread = Thread(
             target=self._gadget_loop, name=f"ep-{self.ep.number}", daemon=True
         )
@@ -745,7 +745,7 @@ class EndpointHandler:
 
     def stop(self):
         log.debug(f"ep-{self.ep.number} stopping")
-        self.stopped = True
+        self.stopped.set()
 
         # we must interrupt blocking ep_read / ep_write calls before ep_disable
         pthread_kill(self._gadget_thread.ident, SIGUSR1)
@@ -761,7 +761,7 @@ class EndpointOutHandler(EndpointHandler):
     """Read OUT transfers from the host and report them to the core Facedancer code."""
 
     def _gadget_loop(self):
-        while not self.stopped:
+        while not self.stopped.is_set():
             try:
                 data = self.backend.device.ep_read(
                     self._handle, self.ep.max_packet_size
@@ -801,15 +801,15 @@ class EndpointInHandler(EndpointHandler):
             self._queue.join()
 
     def _gadget_loop(self):
-        while not self.stopped:
+        while not self.stopped.is_set():
             try:
                 data = self._queue.get()
-                if data is None or self.stopped:
+                if data is None or self.stopped.is_set():
                     break
 
                 if self.backend.verbose > 3:
                     log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
-                if not self.stopped:
+                if not self.stopped.is_set():
                     self._ep_idle.clear()
                     self.backend.device.ep_write(self._handle, data)
                     self._ep_idle.set()
@@ -826,7 +826,7 @@ class EndpointInHandler(EndpointHandler):
         The emulated device will call backend.send_on_endpoint()
         which will call self.send().
         """
-        while not self.stopped:
+        while not self.stopped.is_set():
             # Avoid calling handle_data_requested() while ep_write() is blocked.
             if self._ep_idle.wait(timeout=self.ep.interval * 0.001):
                 self.backend.connected_device.handle_data_requested(self.ep)
