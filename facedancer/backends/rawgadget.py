@@ -16,7 +16,7 @@ import fcntl
 import os
 import time
 
-from threading import Thread
+from threading import Thread, Event
 from signal import signal, SIGUSR1, pthread_kill
 from queue import Queue, Empty
 
@@ -776,14 +776,14 @@ class EndpointOutHandler(EndpointHandler):
         log.debug(f"ep-{self.ep.number} stopped")
 
 
-INTERVAL_MIN_MS = 100
-
 
 class EndpointInHandler(EndpointHandler):
     """Read IN transfers from the core Facedancer code and send to the host."""
 
     def start(self):
         self._queue = Queue()
+        self._ep_idle = Event()
+        self._ep_idle.set()
         self._recv_thread = Thread(
             target=self._recv_loop, name=f"ep-{self.ep.number}", daemon=True
         )
@@ -810,9 +810,12 @@ class EndpointInHandler(EndpointHandler):
                 if self.backend.verbose > 3:
                     log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
                 if not self.stopped:
+                    self._ep_idle.clear()
                     self.backend.device.ep_write(self._handle, data)
+                    self._ep_idle.set()
                 self._queue.task_done()
             except (InterruptedError, BrokenPipeError):
+                self._ep_idle.clear()
                 continue
 
         log.debug(f"ep-{self.ep.number}-gadget stopped")
@@ -824,11 +827,12 @@ class EndpointInHandler(EndpointHandler):
         which will call self.send().
         """
         while not self.stopped:
-            # The interrupt endpoint interval could be 1ms, and polling 1000
-            # times a second for something we can just block on is too noisy.
-            if self.ep.interval < INTERVAL_MIN_MS:
-                self.ep.interval = INTERVAL_MIN_MS
+            # Avoid calling handle_data_requested() while ep_write() is blocked.
+            if self._ep_idle.wait(timeout=self.ep.interval * 0.001):
+                self.backend.connected_device.handle_data_requested(self.ep)
 
-            self.backend.connected_device.handle_data_requested(self.ep)
+            # Either handle_data_requested() might have sent data on the endpoint
+            # or ep_write() is blocked. Yield the execution to other threads.
+            time.sleep(0)
 
         log.debug(f"ep-{self.ep.number}-recv stopped")
