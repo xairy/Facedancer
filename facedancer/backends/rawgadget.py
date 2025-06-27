@@ -358,13 +358,13 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 # Some UDC drivers (e.g. dwc2) issue a disconnect event when the
                 # device is being reconfigured. Thus, treat disconnect as reset.
                 log.info("gadget reset (disconnected)")
-                self._reset()
+                self._handle_reset_event()
             case usb_raw_event_type.USB_RAW_EVENT_SUSPEND:
                 log.info("gadget suspended")
                 self.is_suspended = True
             case usb_raw_event_type.USB_RAW_EVENT_RESET:
                 log.info("gadget reset")
-                self._reset()
+                self._handle_reset_event()
             case usb_raw_event_type.USB_RAW_EVENT_RESUME:
                 self.is_suspended = False
                 log.info("gadget resumed")
@@ -407,7 +407,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         if reenable:
             self._enable_endpoints()
 
-    def _reset(self):
+    def _handle_reset_event(self):
         self.is_configured = False
         self._disable_endpoints()
 
