@@ -137,8 +137,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             max_packet_size_ep0 : Unused.
             device_speed : Requested USB speed for the emulated device.
         """
-        if self.verbose > 0:
-            log.info("connecting device: %s (%r)", usb_device.name, device_speed)
+        log.info("connecting device: %s (%r)", usb_device.name, device_speed)
 
         # Set a no-op handler for SIGUSR1. Sending this signal to the threads
         # that handle enpoints will thus allows interrupting blocking Raw Gadget
@@ -148,8 +147,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.connected_device = usb_device
 
         if speed_override := int(os.environ.get("RG_USB_SPEED", 0)):
-            log.info(f"Overriding device speed with RG_USB_SPEED={speed_override}")
             device_speed = DeviceSpeed(speed_override)
+            log.info(f"overriding device speed with %r", device_speed)
 
         self.device.init_and_run(
             udc_driver=os.environ.get("RG_UDC_DRIVER", "dummy_udc").lower(),
@@ -169,8 +168,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         # Restore the original SIGUSR1 handler.
         signal(SIGUSR1, self._original_signal_handler)
 
-        if self.verbose > 0:
-            log.info("disconnected device: %s", self.connected_device.name)
+        log.info("disconnected device: %s", self.connected_device.name)
 
         self.connected_device = None
 
@@ -199,7 +197,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             configuration : The USBConfiguration object applied by the SET_CONFIG request.
         """
-        log.info("applying configuration")
+        log.info("applying configuration #%d", configuration.number)
+
         self.validate_configuration(configuration)
 
         self._disable_endpoints()
@@ -232,6 +231,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             data             : The data to be sent.
             blocking         : If true, this function should wait for the transfer to complete.
         """
+        log.trace(f"send_on_control_endpoint: {endpoint_number=} len={len(data)} {blocking=}")
+
         assert endpoint_number == 0, "control requests only supported for ep 0"
 
         if in_request.direction == USBDirection.OUT:
@@ -258,13 +259,12 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             data : The data to be sent.
             blocking : Wait for sending. Must be true for control.
         """
+        log.trace(f"send_on_endpoint: {endpoint_number=} len={len(data)} {blocking=}")
+
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError(f"{type(data)=}, must be bytes")
-
         assert endpoint_number != 0, "send_on_endpoint called for control endpoint"
 
-        if self.verbose > 4:
-            log.debug(f"send ep{endpoint_number} len={len(data)} {blocking=}")
         address = USBEndpoint.address_for_number(endpoint_number, USBDirection.IN)
         handler = self.eps[address]
         assert isinstance(handler, EndpointInHandler)
@@ -289,6 +289,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             blocking : True if we should wait for the ACK to be fully issued
                        before returning.
         """
+        log.trace(f"ack_status_stage: {endpoint_number=} direction={direction.name} {blocking=}")
+
         if not self.unacked_request:
             log.debug("ignoring ack_status_stage for already acked OUT request")
             return
@@ -305,10 +307,10 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             endpoint_number : The number of the endpoint to be stalled.
         """
-        if self.verbose > 0:
-            log.info(f"stall endpoint={endpoint_number} {direction.name}")
+        log.trace(f"stall_endpoint: {endpoint_number=} direction={direction.name}")
 
         if endpoint_number == 0:
+            log.trace("ep0: stalling")
             self.device.ep0_stall()
         else:
             # Raw Gadget does support stalling non-control endpoints, but none
@@ -328,10 +330,12 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             return
         match event:
             case RawGadgetEvent(kind, data):
+                log.trace(f"received event: {kind} len={len(data)}")
                 self._handle_event(kind, data)
             case EpReadEvent(ep, handler, data):
+                log.trace(f"received read event: len={len(data)}")
                 if handler.stopped.is_set():
-                    log.debug(f"discarding event {event} from stopped handler")
+                    log.debug(f"discarding read event: handler stopped")
                     return
                 self.connected_device.handle_data_received(ep, data)
             case _:
@@ -342,9 +346,6 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
     def _handle_event(self, kind, data):
-        if self.verbose > 4:
-            log.debug(f"recv event {kind} len={len(data)}")
-
         match kind:
             case usb_raw_event_type.USB_RAW_EVENT_CONNECT:
                 # UDC endpoint information is only obtained for reference:
@@ -352,6 +353,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 # backend can be extended to validate UDC endpoints
                 # capabilities against the device endpoint descriptors.
                 self.eps_info = self.device.eps_info()
+                log.info("gadget connected")
             case usb_raw_event_type.USB_RAW_EVENT_CONTROL:
                 self._handle_control_event(data)
             case usb_raw_event_type.USB_RAW_EVENT_DISCONNECT:
@@ -374,19 +376,16 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 # exception to hint that this backend must be extended as well.
                 raise NotImplementedError
 
-    def _handle_control_event(self, data: bytes):
-        req: USBControlRequest = self.connected_device.create_request(data)
-
-        if self.verbose > 2:
-            log.debug(f"recv control {req}")
+    def _handle_control_event(self, req_header: bytes):
+        req: USBControlRequest = self.connected_device.create_request(req_header)
+        log.debug(f"received control request: {req}")
 
         if req.direction == USBDirection.OUT and req.length > 0:
             rv, data = self.control.read(req.length)
-            self.unacked_request = None
             assert data and rv == req.length
             req.data = bytes(data)
-            if self.verbose > 3:
-                log.debug(f"  data {data.hex(' ', -2)}")
+            log.debug(f"  data: {data.hex(' ', -2)}")
+            self.unacked_request = None
         else:
             self.unacked_request = req
 
@@ -395,7 +394,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             req.get_recipient() == USBRequestRecipient.INTERFACE
             and req.request == USBStandardRequests.SET_INTERFACE
         ):
-            log.info(f"gadget set interface {req.index} alt {req.value}")
+            log.info(f"changing interface #{req.index} altsetting to #{req.value}")
             reenable = True
 
         # TODO: Only reenable endpoints for the interface whose altsetting is being changed.
@@ -459,39 +458,37 @@ class ControlHandler:
     """
 
     def __init__(self, backend):
+        log.debug("ep0: starting handler")
         self.backend = backend
         self.stopped = Event()
-        self._thread = Thread(target=self._gadget_loop, name="ctrl", daemon=True)
+        self._thread = Thread(target=self._gadget_loop, name="ep0", daemon=True)
         self._thread.start()
 
     def stop(self):
-        log.debug(f"ctrl stopping, thread {self._thread.ident}")
+        log.debug("ep0: stopping handler")
         self.stopped.set()
         # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
         pthread_kill(self._thread.ident, SIGUSR1)
         self._thread.join()
 
     def read(self, length: int):
-        if self.backend.verbose > 2:
-            log.info(f"read ep0 {length=}")
-        return self.backend.device.ep0_read(length)
+        log.debug(f"ep0: reading {length} bytes")
+        data = self.backend.device.ep0_read(length)
+        return data
 
     def send(self, data: bytes):
-        if self.backend.verbose > 2:
-            log.info(f"send ep0 {data.hex(' ', -2)}")
+        log.debug(f"ep0: sending {len(data)} bytes")
+        log.trace(f"  data: {data.hex(' ', -2)}")
         self.backend.device.ep0_write(data)
 
     def _gadget_loop(self):
         while not self.stopped.is_set():
             try:
                 event = self.backend.device.event_fetch()
-            except InterruptedError:
+            except interruptederror:
                 continue
-
-            if event is not None:
-                self.backend.queue.put(RawGadgetEvent(event.kind, event.data))
-
-        log.debug("control loop done")
+            self.backend.queue.put(RawGadgetEvent(event.kind, event.data))
+        log.debug("ep0: handler stopped")
 
 
 class EndpointHandler:
@@ -503,9 +500,8 @@ class EndpointHandler:
         self.backend = backend
         self.stopped = Event()
         self._gadget_thread = Thread(
-            target=self._gadget_loop, name=f"ep-{self.ep.number}", daemon=True
+            target=self._gadget_loop, name=f"{self}", daemon=True
         )
-
         # We could validate the endpoint descriptor against the UDC endpoint
         # capabilities and the selected USB device speed. This will, however,
         # limit the ability to emulate devices that do not strictly follow the
@@ -514,22 +510,27 @@ class EndpointHandler:
         # as is. As a trade off, this might lead to unpredictable errors during
         # the device emulation.
         self._handle = self.backend.device.ep_enable(ep.get_descriptor())
-        log.info(f"ep_enable: {ep} (handle={self._handle})")
+        log.debug(f"{self}: enabled (handle={self._handle})")
+
+    def __str__(self):
+        assert self.ep
+        return f"ep{self.ep.number:02x}/{self.ep.direction.name}"
 
     def _gadget_loop(self):
         raise NotImplementedError
 
     def start(self):
+        log.debug(f"{self}: starting handler")
         self._gadget_thread.start()
 
     def stop(self):
-        log.debug(f"ep-{self.ep.number} stopping")
+        log.debug(f"{self}: stopping handler")
         self.stopped.set()
         # Send SIGUSR1 to the thread to interrupt a possibly blocked ioctl.
         pthread_kill(self._gadget_thread.ident, SIGUSR1)
         self._gadget_thread.join()
         self.backend.device.ep_disable(self._handle)
-        log.info(f"ep_disable: {self.ep} (handle={self._handle})")
+        log.debug(f"{self}: disabled (handle={self._handle})")
 
 
 class EndpointOutHandler(EndpointHandler):
@@ -549,7 +550,8 @@ class EndpointOutHandler(EndpointHandler):
                 data = self.backend.device.ep_read(
                     self._handle, self.ep.max_packet_size
                 )
-                log.debug(f"ep_read: handle={self._handle=} len={len(data)=}")
+                log.debug(f"{self}: read {len(data)} bytes")
+                log.trace(f"  data: {data.hex(' ', -2)}")
             except (InterruptedError, BrokenPipeError):
                 continue
 
@@ -557,7 +559,7 @@ class EndpointOutHandler(EndpointHandler):
                 event = EpReadEvent(ep=self.ep, handler=self, data=data)
                 self.backend.queue.put(event)
 
-        log.debug(f"ep-{self.ep.number} stopped")
+        log.debug(f"{self}: handler stopped")
 
 
 
@@ -600,22 +602,21 @@ class EndpointInHandler(EndpointHandler):
                 if data is None or self.stopped.is_set():
                     break
 
-                if self.backend.verbose > 3:
-                    log.debug(f"ep-{self.ep.number} write {data.hex(' ', -2)}")
                 if not self.stopped.is_set():
                     self._ep_idle.clear()
                     rv = self.backend.device.ep_write(self._handle, data)
                     if rv != len(data):
-                        log.warning(f"ep_write: handle={self._handle=} len={len(data)} actual={rv=}")
+                        log.warning(f"{self}: wrote only {rv} bytes instead of {len(data)}")
                     else:
-                        log.debug(f"ep_write: handle={self._handle=} len={rv=}")
+                        log.debug(f"{self}: wrote {rv} bytes")
+                    log.trace(f"  data: {data.hex(' ', -2)}")
                     self._ep_idle.set()
                 self._queue.task_done()
             except (InterruptedError, BrokenPipeError):
                 self._ep_idle.clear()
                 continue
 
-        log.debug(f"ep-{self.ep.number}-gadget stopped")
+        log.debug(f"{self}: gadget handler stopped")
 
     def _recv_loop(self):
         while not self.stopped.is_set():
@@ -629,7 +630,7 @@ class EndpointInHandler(EndpointHandler):
             # or ep_write() is blocked. Yield the execution to other threads.
             time.sleep(0)
 
-        log.debug(f"ep-{self.ep.number}-recv stopped")
+        log.debug(f"{self}: recv handler stopped")
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
