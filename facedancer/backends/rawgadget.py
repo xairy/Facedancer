@@ -618,6 +618,11 @@ class EndpointInHandler(EndpointHandler):
                 data = self._queue.get()
                 if data is None or self.stopped.is_set():
                     break
+                if len(data) == 0:
+                    # In Facedancer tests, handle_data_requested() might return
+                    # a 0-length transfer when called before in_transfer_length
+                    # is set. Ignore this transfer.
+                    continue
                 # Send data to the host.
                 self._ep_idle.clear()
                 rv = self._backend.device.ep_write(self._handle, data)
