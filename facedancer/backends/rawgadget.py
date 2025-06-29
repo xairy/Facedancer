@@ -482,7 +482,8 @@ class ControlHandler:
 
     def send(self, data: bytes):
         log.debug(f"ep0: sending {len(data)} bytes")
-        log.trace(f"  data: {data.hex(' ', -2)}")
+        if len(data) > 0:
+            log.trace(f"  data: {data.hex(' ', -2)}")
         self._backend.device.ep0_write(data)
 
     def _gadget_loop(self):
@@ -559,7 +560,8 @@ class EndpointOutHandler(EndpointHandler):
                     self._handle, self.ep.max_packet_size
                 )
                 log.debug(f"{self}: read {len(data)} bytes")
-                log.trace(f"  data: {data.hex(' ', -2)}")
+                if len(data) > 0:
+                    log.trace(f"  data: {data.hex(' ', -2)}")
             except (InterruptedError, BrokenPipeError):
                 continue
             # Queue data for service_irqs() to be reported to the emulated device.
@@ -625,7 +627,8 @@ class EndpointInHandler(EndpointHandler):
                     log.warning(f"{self}: wrote only {rv} bytes instead of {len(data)}")
                 else:
                     log.debug(f"{self}: wrote {rv} bytes")
-                log.trace(f"  data: {data.hex(' ', -2)}")
+                if len(data) > 0:
+                    log.trace(f"  data: {data.hex(' ', -2)}")
                 self._ep_idle.set()
                 self._queue.task_done()
             except (InterruptedError, BrokenPipeError):
