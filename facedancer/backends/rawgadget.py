@@ -62,8 +62,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
     device: RawGadget
     event_queue: Queue
-    eps: dict[int, EndpointHandler]  # address -> handler
     control: ControlHandler
+    eps: dict[int, EndpointHandler]  # address -> handler
     connected_device: USBDevice
     configuration: USBConfiguration
 
@@ -84,8 +84,8 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         super().__init__(device or RawGadget(), verbose)
 
         self.event_queue = Queue(100)
-        self.eps = {}
         self.control = None
+        self.eps = {}
 
         self.connected_device = None
         self.configuration = None
@@ -166,7 +166,9 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
     def disconnect(self):
         """Disconnects Raw Gadget from the target host."""
+
         assert self.connected_device
+
         self._disable_endpoints()
         self.control.stop()
         self.device.close()
@@ -203,6 +205,9 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Args:
             configuration : The USBConfiguration object applied by the SET_CONFIG request.
         """
+        # TODO: Confirm that this handler is called before SET_CONFIGURATION request is acked.
+        # TODO: Handle configuration == None.
+
         log.info("applying configuration #%d", configuration.number)
 
         self.validate_configuration(configuration)
@@ -214,7 +219,6 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
         self.configuration = configuration
 
-        # TODO: Confirm that we enable endpoints before SET_CONFIGURATION request is acked.
         self._enable_endpoints()
 
     def read_from_endpoint(self, endpoint_number: int) -> bytes:
@@ -245,7 +249,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 log.debug("ignoring send_on_endpoint for already acked OUT request")
                 return
 
-            assert not data, "cannot send data to ep0_read()"
+            assert not data, "cannot send data for OUT request"
             self.control.read(0)
         else:
             self.control.send(data)
@@ -391,8 +395,12 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             assert data and rv == req.length
             req.data = bytes(data)
             log.debug(f"  data: {data.hex(' ', -2)}")
+            # The Linux USB Gadget subsystem automatically acks non-0-length
+            # OUT control requests when the data is read.
             self.unacked_request = None
         else:
+            # But 0-length OUT control requests require explicit ack.
+            # Done later either via ack_status_stage() or send_on_control_endpoint().
             self.unacked_request = req
 
         reenable = False
