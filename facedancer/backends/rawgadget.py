@@ -563,6 +563,8 @@ class EndpointOutHandler(EndpointHandler):
                 if len(data) > 0:
                     log.trace(f"  data: {data.hex(' ', -2)}")
             except (InterruptedError, BrokenPipeError):
+                # BrokenPipeError corresponds to the -ESHUTDOWN error, which
+                # might be returned if the host decides to reset the device.
                 continue
             # Queue data for service_irqs() to be reported to the emulated device.
             self._backend.queue.put(EpReadEvent(handler=self, data=data))
@@ -637,6 +639,8 @@ class EndpointInHandler(EndpointHandler):
                 self._ep_idle.set()
                 self._queue.task_done()
             except (InterruptedError, BrokenPipeError):
+                # BrokenPipeError corresponds to the -ESHUTDOWN error, which
+                # might be returned if the host decides to reset the device.
                 self._ep_idle.clear()
                 continue
 
