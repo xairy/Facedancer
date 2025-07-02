@@ -61,7 +61,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     app_name = "Raw Gadget"
 
     device: RawGadget
-    queue: Queue
+    event_queue: Queue
     eps: dict[int, EndpointHandler]  # address -> handler
     control: ControlHandler
     connected_device: USBDevice
@@ -83,7 +83,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         """
         super().__init__(device or RawGadget(), verbose)
 
-        self.queue = Queue(100)
+        self.event_queue = Queue(100)
         self.eps = {}
         self.control = None
 
@@ -328,7 +328,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         Core event loop. Reacts to events recevied via Raw Gadget from the host.
         """
         try:
-            event = self.queue.get_nowait()
+            event = self.event_queue.get_nowait()
         except Empty:
             # No events, yield to other threads.
             time.sleep(0)
@@ -498,7 +498,7 @@ class ControlHandler:
                 event = self._backend.device.event_fetch()
             except InterruptedError:
                 continue
-            self._backend.queue.put(RawGadgetEvent(event.kind, event.data))
+            self._backend.event_queue.put(RawGadgetEvent(event.kind, event.data))
         log.debug("ep0: handler stopped")
 
 
@@ -573,7 +573,7 @@ class EndpointOutHandler(EndpointHandler):
                 # might be returned if the host decides to reset the device.
                 continue
             # Queue data for service_irqs() to be reported to the emulated device.
-            self._backend.queue.put(EpReadEvent(handler=self, data=data))
+            self._backend.event_queue.put(EpReadEvent(handler=self, data=data))
 
         log.debug(f"{self}: handler stopped")
 
@@ -594,7 +594,7 @@ class EndpointInHandler(EndpointHandler):
     def start(self):
         # This queue is used to pass requested data from the device handler
         # to the gadget handler to be sent to the host.
-        self._queue = Queue()
+        self._data_queue = Queue()
         # This flag indicates whether the gadget handler is idle
         # or blocked on executing a transfer.
         self._ep_idle = Event()
@@ -610,20 +610,20 @@ class EndpointInHandler(EndpointHandler):
     def stop(self):
         # Put None into the queue to unblock the gadget thread that might be
         # blocked on queue.get().
-        self._queue.put(None)
+        self._data_queue.put(None)
         super().stop()
         self._device_thread.join()
 
     def send(self, data: bytes, blocking: bool):
-        self._queue.put(data)
+        self._data_queue.put(data)
         if blocking:
-            self._queue.join()
+            self._data_queue.join()
 
     def _gadget_loop(self):
         while not self.stopped.is_set():
             try:
                 # Fetch data from the device thread.
-                data = self._queue.get()
+                data = self._data_queue.get()
                 if data is None or self.stopped.is_set():
                     break
                 if len(data) == 0:
@@ -643,7 +643,7 @@ class EndpointInHandler(EndpointHandler):
                 if len(data) > 0:
                     log.trace(f"  data: {data.hex(' ', -2)}")
                 self._ep_idle.set()
-                self._queue.task_done()
+                self._data_queue.task_done()
             except (InterruptedError, BrokenPipeError):
                 # BrokenPipeError corresponds to the -ESHUTDOWN error, which
                 # might be returned if the host decides to reset the device.
