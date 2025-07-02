@@ -40,6 +40,7 @@ from construct import (
 
 from ..core import FacedancerApp
 from ..device import USBDevice
+from ..configuration import USBConfiguration
 from ..endpoint import USBEndpoint
 from ..request import USBControlRequest
 from ..types import (
@@ -60,10 +61,11 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
     app_name = "Raw Gadget"
 
     device: RawGadget
-    connected_device: USBDevice
     queue: Queue
     eps: dict[int, EndpointHandler]  # address -> handler
     control: ControlHandler
+    connected_device: USBDevice
+    configuration: USBConfiguration
 
     def __init__(
         self,
@@ -83,9 +85,13 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
 
         self.queue = Queue(100)
         self.eps = {}
-        self.eps_info = None
+        self.control = None
+
         self.connected_device = None
-        self.is_configured = False
+        self.configuration = None
+
+        # These are kept track of but are not used by the backend yet.
+        self.eps_info = None
         self.is_suspended = False
 
         self.device.open()
@@ -207,7 +213,6 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
         self.device.configure()
 
         self.configuration = configuration
-        self.is_configured = True
 
         # TODO: Confirm that we enable endpoints before SET_CONFIGURATION request is acked.
         self._enable_endpoints()
@@ -362,6 +367,7 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
                 log.info("gadget reset (disconnected)")
                 self._handle_reset_event()
             case usb_raw_event_type.USB_RAW_EVENT_SUSPEND:
+                # TODO: Handle suspend/resume.
                 log.info("gadget suspended")
                 self.is_suspended = True
             case usb_raw_event_type.USB_RAW_EVENT_RESET:
@@ -407,14 +413,14 @@ class RawGadgetBackend(FacedancerApp, FacedancerBackend):
             self._enable_endpoints()
 
     def _handle_reset_event(self):
-        self.is_configured = False
+        self.configuration = None
         self._disable_endpoints()
 
         if self.connected_device:
             self.connected_device.handle_bus_reset()
 
     def _enable_endpoints(self):
-        if not self.is_configured:
+        if not self.configuration:
             return
 
         for interface in self.configuration.active_interfaces.values():
